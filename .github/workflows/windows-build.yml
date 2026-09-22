@@ -43,6 +43,13 @@ jobs:
           if (Test-Path $env:SDK_ROOT) { throw 'SDK destination already exists.' }
           git clone https://github.com/KDE/craft.git "$env:RUNNER_TEMP\craft-bootstrap"
           git -C "$env:RUNNER_TEMP\craft-bootstrap" checkout --detach $env:CRAFT_BOOTSTRAP_REF
+          $blueprint = "$env:RUNNER_TEMP\craft-bootstrap\blueprints\dev-utils\pkgconf\pkgconf.py"
+          $original = Get-Content $blueprint -Raw
+          if ($original -notmatch 'self\.defaultTarget = "2\.5\.1"') {
+            throw 'Craft pkgconf blueprint changed; review this workaround.'
+          }
+          $original.Replace('self.defaultTarget = "2.5.1"', 'self.defaultTarget = "2.4.3"') |
+            Set-Content $blueprint -Encoding utf8
           python "$env:RUNNER_TEMP\craft-bootstrap\setup\CraftBootstrap.py" --prefix $env:SDK_ROOT --localDev "$env:RUNNER_TEMP\craft-bootstrap" --use-defaults
           $settings = Get-Content "$env:SDK_ROOT\etc\CraftSettings.ini" -Raw
           if ($settings -notmatch 'ABI\s*=\s*windows-cl-msvc2022-x86_64') {
