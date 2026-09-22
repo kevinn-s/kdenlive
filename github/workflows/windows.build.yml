@@ -1,0 +1,189 @@
+# Put this file at .github/workflows/windows.build.yml in your Kdenlive fork.
+# Manual SDK refresh, followed by a clean build on a SECOND Windows runner.
+# This exports a development SDK; it does not produce a portable application.
+name: Windows dependency SDK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-sdk-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  SDK_ROOT: C:\KdenliveSDK
+  # Reviewed bootstrap revision. Craft's installed packages can still advance;
+  # the exported snapshot, not this SHA alone, defines the dependency versions.
+  CRAFT_BOOTSTRAP_REF: 64de6f938a2244df7201e1a2731eb50c3d31d4a2
+
+jobs:
+  sdk:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Bootstrap KDE Craft (MSVC 2022 x64)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if (Test-Path $env:SDK_ROOT) { throw 'SDK destination already exists.' }
+          git clone https://github.com/KDE/craft.git "$env:RUNNER_TEMP\craft-bootstrap"
+          git -C "$env:RUNNER_TEMP\craft-bootstrap" checkout --detach $env:CRAFT_BOOTSTRAP_REF
+          python "$env:RUNNER_TEMP\craft-bootstrap\setup\CraftBootstrap.py" --prefix $env:SDK_ROOT --localDev "$env:RUNNER_TEMP\craft-bootstrap" --use-defaults
+          $settings = Get-Content "$env:SDK_ROOT\etc\CraftSettings.ini" -Raw
+          if ($settings -notmatch 'ABI\s*=\s*windows-cl-msvc2022-x86_64') {
+            throw 'Unexpected Craft ABI; refusing to create a mismatched SDK.'
+          }
+
+      - name: Install dependency closure using KDE binary cache where available
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $craft = "$env:SDK_ROOT\craft\bin\craft.py"
+          python $craft --ci-mode --install-deps --options '[CodeSigning]Enabled=False' --options 'kdenlive.version=master' kdenlive
+          python $craft --ci-mode cmake ninja
+          # This can compile cache misses; it does NOT compile Kdenlive itself.
+
+      - name: Export installed SDK and standalone environment helper
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $stage = "$env:RUNNER_TEMP\sdk-export\KdenliveSDK"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          # Export installed files only. Do not transfer Craft's build trees,
+          # virtualenv, CI environment snapshots, credentials, or source caches.
+          foreach ($name in @('bin','lib','lib64','libexec','include','share','plugins','qml','translations','dev-utils')) {
+            $source = Join-Path $env:SDK_ROOT $name
+            if (Test-Path $source) {
+              $PSNativeCommandUseErrorActionPreference = $false
+              robocopy $source "$stage\$name" /E /XJ /R:2 /W:1 /NFL /NDL /NJH /NJS
+              $copyExit = $LASTEXITCODE
+              $PSNativeCommandUseErrorActionPreference = $true
+              if ($copyExit -ge 8) { throw "SDK copy failed: $name ($copyExit)" }
+              $global:LASTEXITCODE = 0
+            }
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio 2022 C++ tools were not found.' }
+          $toolset = (Get-Content "$vs\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt" -Raw).Trim()
+          @{
+            sdkRoot = $env:SDK_ROOT
+            abi = 'windows-cl-msvc2022-x86_64'
+            msvcToolsVersion = $toolset
+            kdenliveCommit = $env:GITHUB_SHA
+            craftCommit = (git -C "$env:SDK_ROOT\craft" rev-parse HEAD)
+            runUrl = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            createdUtc = [DateTime]::UtcNow.ToString('o')
+          } | ConvertTo-Json | Set-Content "$stage\sdk-manifest.json" -Encoding utf8
+          # Record Craft's dependency inventory without exporting its database.
+          python "$env:SDK_ROOT\craft\bin\craft.py" --ci-mode --print-installed | Set-Content "$stage\installed-packages.txt" -Encoding utf8
+          @'
+          # Dot-source this file in a fresh PowerShell 7 session.
+          $ErrorActionPreference = 'Stop'
+          $sdk = 'C:\KdenliveSDK'
+          if ($PSScriptRoot.TrimEnd('\') -ine $sdk) {
+            throw 'Extract the SDK to C:\KdenliveSDK; arbitrary relocation is unsupported.'
+          }
+          $manifest = Get-Content "$sdk\sdk-manifest.json" -Raw | ConvertFrom-Json
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw 'Install Visual Studio 2022 C++ Build Tools first.' }
+          $vs = & $vswhere -latest -products '*' -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio 2022 C++ tools were not found.' }
+          & "$vs\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          if (-not $env:VCToolsVersion) { throw 'MSVC environment initialization failed.' }
+          if ([version]$env:VCToolsVersion.TrimEnd('\') -lt [version]$manifest.msvcToolsVersion) {
+            throw "Update VS 2022 C++ tools: SDK producer used $($manifest.msvcToolsVersion)."
+          }
+          $env:PATH = "$sdk\dev-utils\bin;$sdk\bin;$sdk\libexec;$env:PATH"
+          $env:CC = 'cl'
+          $env:CXX = 'cl'
+          $env:CMAKE_PREFIX_PATH = $sdk
+          $env:PKG_CONFIG_PATH = "$sdk\lib\pkgconfig;$sdk\share\pkgconfig"
+          $env:QT_PLUGIN_PATH = "$sdk\plugins;$sdk\lib\plugins;$sdk\bin"
+          $env:QML_IMPORT_PATH = "$sdk\qml;$sdk\lib\qml"
+          $env:QML2_IMPORT_PATH = $env:QML_IMPORT_PATH
+          $env:XDG_DATA_DIRS = "$sdk\share"
+          $env:MLT_REPOSITORY = "$sdk\lib\mlt-7"
+          $env:MLT_DATA = "$sdk\share\mlt-7"
+          $env:MLT_PROFILES_PATH = "$sdk\share\mlt-7\profiles"
+          $env:FREI0R_PATH = "$sdk\lib\frei0r-1"
+          $env:LADSPA_PATH = "$sdk\lib\ladspa"
+          foreach ($tool in @('cl','cmake','ninja')) { Get-Command $tool -ErrorAction Stop | Out-Null }
+          Write-Host "SDK loaded: $sdk; MSVC $env:VCToolsVersion"
+          '@ | Set-Content "$stage\Enter-KdenliveSDK.ps1" -Encoding utf8
+          foreach ($required in @('include','lib','bin','share','dev-utils\bin\cmake.exe','dev-utils\bin\ninja.exe')) {
+            if (-not (Test-Path "$stage\$required")) { throw "SDK is missing $required" }
+          }
+          $archive = "$env:RUNNER_TEMP\kdenlive-sdk-msvc2022-x64.7z"
+          & 'C:\Program Files\7-Zip\7z.exe' a -t7z -mx=3 $archive "$stage"
+          (Get-FileHash $archive -Algorithm SHA256).Hash | Set-Content "$archive.sha256" -Encoding ascii
+
+      - name: Upload SDK (use only after validate job succeeds)
+        uses: actions/upload-artifact@v4
+        with:
+          name: kdenlive-sdk-msvc2022-x64
+          path: |
+            ${{ runner.temp }}/kdenlive-sdk-msvc2022-x64.7z
+            ${{ runner.temp }}/kdenlive-sdk-msvc2022-x64.7z.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  validate:
+    needs: sdk
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kdenlive-sdk-msvc2022-x64
+          path: sdk-download
+
+      - name: Extract on a clean runner, compile and install Kdenlive
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $archive = "$env:GITHUB_WORKSPACE\sdk-download\kdenlive-sdk-msvc2022-x64.7z"
+          $expected = (Get-Content "$archive.sha256" -Raw).Trim()
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) { throw 'Checksum mismatch.' }
+          if (Test-Path $env:SDK_ROOT) { throw 'Validation requires a fresh SDK destination.' }
+          & 'C:\Program Files\7-Zip\7z.exe' x $archive '-oC:\' -y
+          . "$env:SDK_ROOT\Enter-KdenliveSDK.ps1"
+          cmake -S "$env:GITHUB_WORKSPACE" -B C:/kd-build -G Ninja `
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
+            -DCMAKE_PREFIX_PATH=C:/KdenliveSDK `
+            -DCMAKE_INSTALL_PREFIX=C:/KdenliveSDK `
+            -DCMAKE_REQUIRED_INCLUDES=C:/KdenliveSDK/include `
+            -DCMAKE_C_STANDARD_INCLUDE_DIRECTORIES=C:/KdenliveSDK/include `
+            -DKDE_INSTALL_USE_QT_SYS_PATHS=ON `
+            -DCMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP=ON `
+            -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=ON -DUSE_DBUS=OFF -DRELEASE_BUILD=OFF
+          cmake --build C:/kd-build --parallel 2
+          cmake --install C:/kd-build
+          if (-not (Test-Path "$env:SDK_ROOT\bin\kdenlive.exe")) { throw 'Kdenlive was not installed.' }
+          @"
+          ## SDK validation passed
+          Clean-runner configure, compile and install passed for $env:GITHUB_SHA.
+          SDK artifact: kdenlive-sdk-msvc2022-x64 (30-day retention).
+          GUI playback/rendering and portable packaging are NOT tested by this job.
+          "@ >> $env:GITHUB_STEP_SUMMARY
