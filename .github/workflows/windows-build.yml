@@ -4,6 +4,10 @@
 name: Windows dependency SDK
 
 on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/windows-build.yml'
   workflow_dispatch:
 
 permissions:
