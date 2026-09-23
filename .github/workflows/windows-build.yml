@@ -1,4 +1,4 @@
-# Put this file at .github/workflows/windows.build.yml in your Kdenlive fork.
+# Put this file at .github/workflows/windows-build.yml in your Kdenlive fork.
 # Manual SDK refresh, followed by a clean build on a SECOND Windows runner.
 # This exports a development SDK; it does not produce a portable application.
 name: Windows dependency SDK
@@ -87,45 +87,35 @@ jobs:
           if (-not (Test-Path $blueprint)) { throw "Could not locate gettext blueprint at $blueprint to patch." }
           Write-Host "Patching $blueprint"
 
-          $content = Get-Content $blueprint -Raw
-          $nl = "`n"
-
-          $badBlock = (@(
-            '            self.subinfo.options.configure.args += [',
-            '                "ac_cv_func_wcslen=yes",',
-            '                "ac_cv_func_memmove=yes"',
-            '                # The following are required for a full gettext built (libintl and tools).',
-            '                "gl_cv_func_printf_directive_n=no",  # segfaults otherwise with popup window',
-            '                "ac_cv_func_memset=yes",  # not detected in release builds',
-            '                "ac_cv_header_pthread_h=no",',
-            '                "ac_cv_header_dirent_h=no",',
-            '                "ac_cv_header_getopt_h=no",',
-            '            ]'
-          )) -join $nl
-
-          $fixedBlock = (@(
-            '            self.subinfo.options.configure.args += [',
-            '                "ac_cv_func_wcslen=yes",',
-            '                "ac_cv_func_memmove=yes",',
-            '                # The following are required for a full gettext built (libintl and tools).',
-            '                "gl_cv_func_printf_directive_n=no",  # segfaults otherwise with popup window',
-            '                "ac_cv_func_memset=yes",  # not detected in release builds',
-            '                "ac_cv_header_pthread_h=no",',
-            '                "ac_cv_header_dirent_h=no",',
-            '                "ac_cv_header_getopt_h=no",',
-            '                # Force the win-iconv import lib onto the link line: gnulib''s',
-            '                # LIBICONV autodetection can come out empty here, which drops',
-            '                # iconv_open/iconv/iconv_close and fails libgettextlib.dll',
-            '                # with LNK2019/LNK1120 (see workflow comment for details).',
-            '                "LDFLAGS=-liconv",',
-            '            ]'
-          )) -join $nl
-
-          if ($content -notmatch [regex]::Escape($badBlock)) {
-            throw 'gettext.py did not match the expected known-buggy block - upstream may have changed it; update this patch before proceeding.'
+          # Read and write without PowerShell newline or encoding conversions.
+          $content = [System.IO.File]::ReadAllText($blueprint)
+          $memmoveLine = '                "ac_cv_func_memmove=yes"'
+          $memmoveCount = [regex]::Matches($content, [regex]::Escape($memmoveLine)).Count
+          if ($memmoveCount -ne 1) {
+            throw "Expected exactly one gettext memmove setting; found $memmoveCount."
           }
-          $content = $content.Replace($badBlock, $fixedBlock)
-          Set-Content -Path $blueprint -Value $content -NoNewline -Encoding utf8
+          $content = $content.Replace($memmoveLine, $memmoveLine + ',')
+
+          $getoptLine = '                "ac_cv_header_getopt_h=no",'
+          $getoptCount = [regex]::Matches($content, [regex]::Escape($getoptLine)).Count
+          if ($getoptCount -ne 1) {
+            throw "Expected exactly one gettext getopt setting; found $getoptCount."
+          }
+          if ($content.Contains('"LIBS=-liconv"')) {
+            throw 'The gettext iconv link setting is already present; review upstream before patching.'
+          }
+          $lineEnding = if ($content.Contains("`r`n")) { "`r`n" } else { "`n" }
+          $iconvSetting = '                "LIBS=-liconv",'
+          $content = $content.Replace(
+            $getoptLine,
+            $getoptLine + $lineEnding + $iconvSetting
+          )
+
+          [System.IO.File]::WriteAllText(
+            $blueprint,
+            $content,
+            [System.Text.UTF8Encoding]::new($false)
+          )
           Write-Host 'gettext blueprint patched.'
           # --- End patch ---------------------------------------------------------
 
@@ -278,3 +268,4 @@ jobs:
           SDK artifact: kdenlive-sdk-msvc2022-x64 (30-day retention).
           GUI playback/rendering and portable packaging are NOT tested by this job.
           "@ >> $env:GITHUB_STEP_SUMMARY
+
