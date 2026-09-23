@@ -64,21 +64,13 @@ jobs:
           git clone https://github.com/KDE/craft.git "$env:RUNNER_TEMP\craft-bootstrap"
           git -C "$env:RUNNER_TEMP\craft-bootstrap" checkout --detach $env:CRAFT_BOOTSTRAP_REF
 
-          python "$env:RUNNER_TEMP\craft-bootstrap\setup\CraftBootstrap.py" `
-            --prefix $env:SDK_ROOT `
-            --localDev "$env:RUNNER_TEMP\craft-bootstrap" `
-            --use-defaults
-
-          $settings = Get-Content "$env:SDK_ROOT\etc\CraftSettings.ini" -Raw
-          if ($settings -notmatch 'ABI\s*=\s*windows-cl-msvc2022-x86_64') {
-            throw 'Unexpected Craft ABI; refusing to create a mismatched SDK.'
-          }
-
-      - name: Patch gettext blueprint (MSVC iconv link fix)
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-
+          # --- Patch gettext blueprint (MSVC iconv link fix) -------------------
+          # gettext is pulled in while Craft self-hosts its own core (it shows up
+          # in the bootstrap's own package list), so this has to be patched into
+          # the craft-bootstrap clone BEFORE CraftBootstrap.py runs - patching
+          # the installed copy afterwards is too late, since bootstrap already
+          # failed building it by then.
+          #
           # Known-bad in the current KDE/craft gettext blueprint on MSVC:
           #   1) a missing comma silently concatenates two adjacent Python
           #      string literals in configure.args into one bogus argument,
@@ -91,17 +83,8 @@ jobs:
           #        fatal error LNK1120: 3 unresolved externals
           # This patch fixes the comma bug and forces -liconv onto the link
           # line so it no longer depends on gnulib's autodetection for it.
-          $candidates = @(
-            (Join-Path $env:SDK_ROOT 'craft\blueprints\libs\gettext\gettext.py'),
-            (Join-Path $env:SDK_ROOT 'craft-tmp\blueprints\libs\gettext\gettext.py')
-          )
-          $blueprint = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $blueprint) {
-            $blueprint = Get-ChildItem -Path $env:SDK_ROOT -Recurse -Filter 'gettext.py' -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -match '[\\/]libs[\\/]gettext[\\/]' } |
-              Select-Object -First 1 -ExpandProperty FullName
-          }
-          if (-not $blueprint) { throw 'Could not locate the gettext blueprint to patch.' }
+          $blueprint = Join-Path "$env:RUNNER_TEMP\craft-bootstrap" 'blueprints\libs\gettext\gettext.py'
+          if (-not (Test-Path $blueprint)) { throw "Could not locate gettext blueprint at $blueprint to patch." }
           Write-Host "Patching $blueprint"
 
           $content = Get-Content $blueprint -Raw
@@ -139,12 +122,23 @@ jobs:
           )) -join $nl
 
           if ($content -notmatch [regex]::Escape($badBlock)) {
-            Write-Warning 'gettext.py did not match the expected known-buggy block (upstream may have changed it) - skipping patch.'
-          } else {
-            $content = $content.Replace($badBlock, $fixedBlock)
-            Set-Content -Path $blueprint -Value $content -NoNewline -Encoding utf8
-            Write-Host 'gettext blueprint patched.'
+            throw 'gettext.py did not match the expected known-buggy block - upstream may have changed it; update this patch before proceeding.'
           }
+          $content = $content.Replace($badBlock, $fixedBlock)
+          Set-Content -Path $blueprint -Value $content -NoNewline -Encoding utf8
+          Write-Host 'gettext blueprint patched.'
+          # --- End patch ---------------------------------------------------------
+
+          python "$env:RUNNER_TEMP\craft-bootstrap\setup\CraftBootstrap.py" `
+            --prefix $env:SDK_ROOT `
+            --localDev "$env:RUNNER_TEMP\craft-bootstrap" `
+            --use-defaults
+
+          $settings = Get-Content "$env:SDK_ROOT\etc\CraftSettings.ini" -Raw
+          if ($settings -notmatch 'ABI\s*=\s*windows-cl-msvc2022-x86_64') {
+            throw 'Unexpected Craft ABI; refusing to create a mismatched SDK.'
+          }
+
 
       - name: Install dependency closure using KDE binary cache where available
         run: |
