@@ -1,7 +1,7 @@
 # Put this file at .github/workflows/windows-build.yml in your Kdenlive fork.
-# Manual SDK refresh, followed by a clean build on a SECOND Windows runner.
-# This exports a development SDK; it does not produce a portable application.
-name: Windows dependency SDK
+# Full Craft build, followed by a clean build of this fork on a SECOND Windows runner.
+# The SDK also contains Craft's upstream Kdenlive build; it is not a portable application.
+name: Windows full Craft build and SDK
 
 on:
   push:
@@ -129,15 +129,42 @@ jobs:
             throw 'Unexpected Craft ABI; refusing to create a mismatched SDK.'
           }
 
+      - name: Disable GLib translations while Craft msgfmt crashes on Windows
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          # Craft checks out KDE package blueprints during bootstrap.
+          $locations = Join-Path $env:SDK_ROOT 'etc\blueprints\locations'
+          if (-not (Test-Path $locations)) {
+            throw "Craft blueprint locations directory is missing: $locations"
+          }
+          $glibBlueprints = @(Get-ChildItem $locations -Recurse -File -Filter 'glib.py' |
+            Where-Object { $_.FullName -match '[\\/]libs[\\/]glib[\\/]glib\.py$' })
+          if ($glibBlueprints.Count -ne 1) {
+            throw "Expected exactly one KDE GLib blueprint, found $($glibBlueprints.Count)."
+          }
+          $glibBlueprint = $glibBlueprints[0].FullName
+          $content = [System.IO.File]::ReadAllText($glibBlueprint)
+          $anchor = '"-Dman=false"'
+          $count = [regex]::Matches($content, [regex]::Escape($anchor)).Count
+          if ($count -ne 1 -or $content.Contains('"-Dnls=disabled"')) {
+            throw "GLib blueprint options changed; inspect $glibBlueprint before patching."
+          }
+          $content = $content.Replace($anchor, $anchor + ', "-Dnls=disabled"')
+          [System.IO.File]::WriteAllText(
+            $glibBlueprint, $content, [System.Text.UTF8Encoding]::new($false)
+          )
+          Write-Host "Disabled GLib translation catalog generation in $glibBlueprint"
 
-      - name: Install dependency closure using KDE binary cache where available
+
+      - name: Build Kdenlive with Craft using KDE binary cache where available
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           $craft = "$env:SDK_ROOT\craft\bin\craft.py"
-          python $craft --ci-mode --install-deps --options '[CodeSigning]Enabled=False' --options 'kdenlive.version=master' kdenlive
+          python $craft --ci-mode --options '[CodeSigning]Enabled=False' --options 'kdenlive.version=master' kdenlive
           python $craft --ci-mode cmake ninja
-          # This can compile cache misses; it does NOT compile Kdenlive itself.
+          # Craft builds its blueprint's Kdenlive checkout, then the validate job builds this fork.
 
       - name: Export installed SDK and standalone environment helper
         run: |
@@ -145,7 +172,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $stage = "$env:RUNNER_TEMP\sdk-export\KdenliveSDK"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          # Export installed files only. Do not transfer Craft's build trees,
+          # Export installed files, including Craft's upstream Kdenlive build. Do not transfer build trees,
           # virtualenv, CI environment snapshots, credentials, or source caches.
           foreach ($name in @('bin','lib','lib64','libexec','include','share','plugins','qml','translations','dev-utils')) {
             $source = Join-Path $env:SDK_ROOT $name
@@ -268,4 +295,3 @@ jobs:
           SDK artifact: kdenlive-sdk-msvc2022-x64 (30-day retention).
           GUI playback/rendering and portable packaging are NOT tested by this job.
           "@ >> $env:GITHUB_STEP_SUMMARY
-
