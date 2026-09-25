@@ -1,133 +1,26 @@
-# Put this file at .github/workflows/windows-build.yml in your Kdenlive fork.
-# Full Craft build, followed by a clean build of this fork on a SECOND Windows runner.
-# The SDK also contains Craft's upstream Kdenlive build; it is not a portable application.
-name: Windows full Craft build and SDK
 
-on:
-  push:
-    branches: [master]
-    paths:
-      - '.github/workflows/windows-build.yml'
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: windows-sdk-${{ github.ref }}
-  cancel-in-progress: false
-
-defaults:
-  run:
-    shell: pwsh
-
-env:
-  SDK_ROOT: C:\KdenliveSDK
-  # Reviewed bootstrap revision. Craft's installed packages can still advance;
-  # the exported snapshot, not this SHA alone, defines the dependency versions.
-  CRAFT_BOOTSTRAP_REF: 64de6f938a2244df7201e1a2731eb50c3d31d4a2
-
-jobs:
-  sdk:
-    runs-on: windows-2022
-    timeout-minutes: 350
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          
-      - name: Bootstrap KDE Craft (MSVC 2022 x64)
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-
-          if (Test-Path $env:SDK_ROOT) {
-            throw 'SDK destination already exists.'
-          }
-
-          # GitHub's Windows runner has a separate MinGW installation.
-          # Remove it so Craft uses make from its own MSYS installation.
-          $env:PATH = (($env:PATH -split ';' | Where-Object {
-            $_ -notmatch '(?i)[\\/](mingw|msys)(32|64)?[\\/](usr[\\/])?bin[\\/]?$'
-          }) -join ';')
-
-          $foreignMake = Get-Command make.exe -ErrorAction SilentlyContinue
-          if ($foreignMake -and
-              $foreignMake.Source -match '(?i)[\\/](mingw|msys)') {
-            throw "Foreign make remains on PATH: $($foreignMake.Source)"
-          }
-
-          git clone https://github.com/KDE/craft.git "$env:RUNNER_TEMP\craft-bootstrap"
-          git -C "$env:RUNNER_TEMP\craft-bootstrap" checkout --detach $env:CRAFT_BOOTSTRAP_REF
-
-          # --- Patch gettext blueprint (MSVC iconv link fix) -------------------
-          # gettext is pulled in while Craft self-hosts its own core (it shows up
-          # in the bootstrap's own package list), so this has to be patched into
-          # the craft-bootstrap clone BEFORE CraftBootstrap.py runs - patching
-          # the installed copy afterwards is too late, since bootstrap already
-          # failed building it by then.
-          #
-          # Known-bad in the current KDE/craft gettext blueprint on MSVC:
-          #   1) a missing comma silently concatenates two adjacent Python
-          #      string literals in configure.args into one bogus argument,
-          #      so several ac_cv_*/gl_cv_* overrides never reach ./configure.
-          #   2) libgettextlib links against libxml2's bundled encoding.c,
-          #      which needs iconv_open/iconv/iconv_close from win-iconv
-          #      (libs/iconv on Windows), but $LIBICONV can end up empty,
-          #      producing:
-          #        error LNK2019: unresolved external symbol iconv_open ...
-          #        fatal error LNK1120: 3 unresolved externals
-          # This patch fixes the comma bug and forces -liconv onto the link
-          # line so it no longer depends on gnulib's autodetection for it.
-          $blueprint = Join-Path "$env:RUNNER_TEMP\craft-bootstrap" 'blueprints\libs\gettext\gettext.py'
-          if (-not (Test-Path $blueprint)) { throw "Could not locate gettext blueprint at $blueprint to patch." }
-          Write-Host "Patching $blueprint"
-
-          # Read and write without PowerShell newline or encoding conversions.
-          $content = [System.IO.File]::ReadAllText($blueprint)
-          $memmoveLine = '                "ac_cv_func_memmove=yes"'
-          $memmoveCount = [regex]::Matches($content, [regex]::Escape($memmoveLine)).Count
-          if ($memmoveCount -ne 1) {
-            throw "Expected exactly one gettext memmove setting; found $memmoveCount."
-          }
-          $content = $content.Replace($memmoveLine, $memmoveLine + ',')
-
-          $getoptLine = '                "ac_cv_header_getopt_h=no",'
-          $getoptCount = [regex]::Matches($content, [regex]::Escape($getoptLine)).Count
-          if ($getoptCount -ne 1) {
-            throw "Expected exactly one gettext getopt setting; found $getoptCount."
-          }
-          if ($content.Contains('"LIBS=-liconv"')) {
-            throw 'The gettext iconv link setting is already present; review upstream before patching.'
-          }
-          $lineEnding = if ($content.Contains("`r`n")) { "`r`n" } else { "`n" }
-          $iconvSetting = '                "LIBS=-liconv",'
-          $content = $content.Replace(
-            $getoptLine,
-            $getoptLine + $lineEnding + $iconvSetting
-          )
-
-          [System.IO.File]::WriteAllText(
-            $blueprint,
-            $content,
-            [System.Text.UTF8Encoding]::new($false)
-          )
-          Write-Host 'gettext blueprint patched.'
-          # --- End patch ---------------------------------------------------------
-
-          python "$env:RUNNER_TEMP\craft-bootstrap\setup\CraftBootstrap.py" `
-            --prefix $env:SDK_ROOT `
-            --localDev "$env:RUNNER_TEMP\craft-bootstrap" `
-            --use-defaults
-
-          $settings = Get-Content "$env:SDK_ROOT\etc\CraftSettings.ini" -Raw
-          if ($settings -notmatch 'ABI\s*=\s*windows-cl-msvc2022-x86_64') {
+    
+  
             throw 'Unexpected Craft ABI; refusing to create a mismatched SDK.'
           }
+
+          # Qt's Craft blueprint uses a substituted drive for short Windows paths.
+          # CraftBootstrap leaves the drive letter commented out by default.
+          $occupiedDrives = @([System.IO.DriveInfo]::GetDrives() | ForEach-Object Name)
+          if ($occupiedDrives -contains 'Z:\') {
+            throw 'Z: is already in use; choose a free Craft [ShortPath] DriveLetter.'
+          }
+          $settingsPath = Join-Path $env:SDK_ROOT 'etc\CraftSettings.ini'
+          $settingsText = [System.IO.File]::ReadAllText($settingsPath)
+          $driveSetting = '(?m)^#DriveLetter\s*=\s*Z:/'
+          if ([regex]::Matches($settingsText, $driveSetting).Count -ne 1) {
+            throw 'Craft short-path setting changed; review CraftSettings.ini before building Qt.'
+          }
+          $settingsText = [regex]::Replace($settingsText, $driveSetting, 'DriveLetter = Z:/')
+          [System.IO.File]::WriteAllText(
+            $settingsPath, $settingsText, [System.Text.UTF8Encoding]::new($false)
+          )
+          Write-Host 'Craft short-path drive set to Z:/'
 
       - name: Disable GLib translations while Craft msgfmt crashes on Windows
         run: |
@@ -268,30 +161,4 @@ jobs:
 
       - name: Extract on a clean runner, compile and install Kdenlive
         run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          $archive = "$env:GITHUB_WORKSPACE\sdk-download\kdenlive-sdk-msvc2022-x64.7z"
-          $expected = (Get-Content "$archive.sha256" -Raw).Trim()
-          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) { throw 'Checksum mismatch.' }
-          if (Test-Path $env:SDK_ROOT) { throw 'Validation requires a fresh SDK destination.' }
-          & 'C:\Program Files\7-Zip\7z.exe' x $archive '-oC:\' -y
-          . "$env:SDK_ROOT\Enter-KdenliveSDK.ps1"
-          cmake -S "$env:GITHUB_WORKSPACE" -B C:/kd-build -G Ninja `
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo `
-            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
-            -DCMAKE_PREFIX_PATH=C:/KdenliveSDK `
-            -DCMAKE_INSTALL_PREFIX=C:/KdenliveSDK `
-            -DCMAKE_REQUIRED_INCLUDES=C:/KdenliveSDK/include `
-            -DCMAKE_C_STANDARD_INCLUDE_DIRECTORIES=C:/KdenliveSDK/include `
-            -DKDE_INSTALL_USE_QT_SYS_PATHS=ON `
-            -DCMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP=ON `
-            -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=ON -DUSE_DBUS=OFF -DRELEASE_BUILD=OFF
-          cmake --build C:/kd-build --parallel 2
-          cmake --install C:/kd-build
-          if (-not (Test-Path "$env:SDK_ROOT\bin\kdenlive.exe")) { throw 'Kdenlive was not installed.' }
-          @"
-          ## SDK validation passed
-          Clean-runner configure, compile and install passed for $env:GITHUB_SHA.
-          SDK artifact: kdenlive-sdk-msvc2022-x64 (30-day retention).
-          GUI playback/rendering and portable packaging are NOT tested by this job.
-          "@ >> $env:GITHUB_STEP_SUMMARY
+
